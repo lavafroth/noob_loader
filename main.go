@@ -33,6 +33,7 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	pool := api.NewServerPoolWithPeers(peers, logger)
+	go pool.StartHealthChecks()
 
 	server := http.Server{
 		Addr:    fmt.Sprintf(":%d", port),

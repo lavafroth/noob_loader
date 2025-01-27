@@ -8,17 +8,20 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/newtoallofthis123/loader/server"
 )
 
 type ServerPool struct {
-	peers  []*server.Server
-	curr   uint64
-	lookup map[*url.URL]*server.Server
-	reqs   map[string]*url.URL
-	logger *slog.Logger
-	rw     sync.RWMutex
+	peers       []*server.Server
+	curr        uint64
+	lookup      map[*url.URL]*server.Server
+	reqs        map[string]*url.URL
+	logger      *slog.Logger
+	rw          sync.RWMutex
+	lastChecked time.Time
+	wg          sync.WaitGroup
 }
 
 type Request struct {
@@ -29,25 +32,31 @@ type Request struct {
 
 func NewServerPool(logger *slog.Logger) *ServerPool {
 	return &ServerPool{
-		peers:  make([]*server.Server, 0),
-		curr:   0,
-		lookup: make(map[*url.URL]*server.Server, 0),
-		reqs:   make(map[string]*url.URL, 0),
-		logger: logger,
-		rw:     sync.RWMutex{},
+		peers:       make([]*server.Server, 0),
+		curr:        0,
+		lookup:      make(map[*url.URL]*server.Server, 0),
+		reqs:        make(map[string]*url.URL, 0),
+		logger:      logger,
+		rw:          sync.RWMutex{},
+		wg:          sync.WaitGroup{},
+		lastChecked: time.Now(),
 	}
 }
 
 func NewServerPoolWithPeers(peers []*server.Server, logger *slog.Logger) *ServerPool {
-	return &ServerPool{
-		peers:  peers,
-		curr:   ranIndex(len(peers)),
-		lookup: makeLookUp(peers),
-		reqs:   make(map[string]*url.URL, 0),
-		logger: logger,
-		rw:     sync.RWMutex{},
+	server := &ServerPool{
+		peers:       peers,
+		curr:        ranIndex(len(peers)),
+		lookup:      makeLookUp(peers),
+		reqs:        make(map[string]*url.URL, 0),
+		logger:      logger,
+		rw:          sync.RWMutex{},
+		wg:          sync.WaitGroup{},
+		lastChecked: time.Now(),
 	}
 
+	server.reorder()
+	return server
 }
 
 func (s *ServerPool) DebugPrint() {
@@ -77,16 +86,52 @@ func (s *ServerPool) AddServer(server *server.Server) {
 	s.rw.Unlock()
 }
 
+func (sp *ServerPool) StartHealthChecks() {
+	ticker := time.NewTicker(1 * time.Minute)
+	sp.wg.Add(1)
+
+	go func() {
+		for range ticker.C {
+			sp.CheckHealth()
+		}
+	}()
+
+	sp.wg.Wait()
+}
 func (s *ServerPool) CheckHealth() {
 	s.logger.Info(fmt.Sprintf("Checking pool health"))
-	s.rw.Lock()
+	var wg sync.WaitGroup
 	for _, peer := range s.peers {
-		peer.UpdateStatus()
+		wg.Add(1)
+
+		go func(p *server.Server) {
+			defer wg.Done()
+			p.UpdateStatus()
+			if !p.IsAlive() {
+				s.logger.Info(fmt.Sprintf("%s is down", p.Url))
+			}
+		}(peer)
 	}
-	s.rw.Unlock()
+
+	wg.Wait()
+	s.logger.Info("Pool check completed")
+}
+
+func (s *ServerPool) shouldReOrder() bool {
+	s.rw.RLock()
+	should := time.Since(s.lastChecked) >= time.Minute
+	s.rw.RUnlock()
+	return should
 }
 
 func (s *ServerPool) NextPeer() *server.Server {
+	if s.shouldReOrder() {
+		s.rw.Lock()
+		s.reorder()
+		s.logger.Info(fmt.Sprintf("Reordered"))
+		s.lastChecked = time.Now()
+		s.rw.Unlock()
+	}
 	next := s.NextIndex()
 	circle := len(s.peers) + next
 	for i := next; i < circle; i++ {
@@ -108,10 +153,22 @@ func (s *ServerPool) handleErr(w http.ResponseWriter, r *http.Request, e error) 
 	server.UpdateStatus()
 	if !server.IsAlive() {
 		s.logger.Error(fmt.Sprintf("Server %s is not alive", server.Url))
+		s.CheckHealth()
 	}
+	delete(s.reqs, r.RemoteAddr)
 	s.rw.Unlock()
 
 	s.Serve(w, r)
+}
+
+func (s *ServerPool) handleRes(res *http.Response) error {
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("Server res failed with err and status code %d", res.StatusCode)
+	}
+	s.rw.Lock()
+	delete(s.reqs, res.Request.RemoteAddr)
+	s.rw.Unlock()
+	return nil
 }
 
 func (s *ServerPool) Serve(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +178,7 @@ func (s *ServerPool) Serve(w http.ResponseWriter, r *http.Request) {
 		s.reqs[r.RemoteAddr] = peer.Url
 		s.rw.Unlock()
 		peer.Proxy.ErrorHandler = s.handleErr
+		peer.Proxy.ModifyResponse = s.handleRes
 		peer.Proxy.ServeHTTP(w, r)
 		return
 	}
