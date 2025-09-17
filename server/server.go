@@ -10,7 +10,7 @@ import (
 
 type Server struct {
 	Url          *url.URL
-	Alive        bool
+	alive        bool
 	Proxy        *httputil.ReverseProxy
 	ResponseTime time.Duration
 }
@@ -37,23 +37,19 @@ func CheckResponseTime(url *url.URL) (time.Duration, bool) {
 	if err != nil {
 		return 0, false
 	}
-	duration := time.Since(start)
 	defer conn.Close()
+	duration := time.Since(start)
 	return duration, true
 }
 
 func (s *Server) UpdateStatus() {
-	res, isAlive := CheckResponseTime(s.Url)
-	s.ResponseTime = res
-	s.Alive = isAlive
+	s.ResponseTime, s.alive = CheckResponseTime(s.Url)
 }
 
 func (s *Server) IsAlive() bool {
-	alive := s.Alive
-
-	return alive
+	return s.alive
 }
 
 func (s *Server) Debug() string {
-	return fmt.Sprintf("Peer: %s, Alive: %t, ResponseTime: %f", s.Url, s.Alive, s.ResponseTime.Seconds())
+	return fmt.Sprintf("Peer: %s, Alive: %t, ResponseTime: %f", s.Url, s.alive, s.ResponseTime.Seconds())
 }
